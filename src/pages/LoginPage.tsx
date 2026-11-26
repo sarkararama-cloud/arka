@@ -239,8 +239,18 @@ export function LoginPage() {
           </div>
 
           {error && (
-            <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
-              {error}
+            <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 space-y-2">
+              <p>{error}</p>
+              {(error.includes('SQL Schema') || error.includes('profiles')) && (
+                <button
+                  type="button"
+                  onClick={openSchemaModal}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-red-800 bg-white border border-red-200 rounded-md hover:bg-red-100 transition-colors cursor-pointer"
+                >
+                  <Database className="w-3.5 h-3.5" />
+                  <span>Buka SQL Schema untuk Sinkronisasi</span>
+                </button>
+              )}
             </div>
           )}
 

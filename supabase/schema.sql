@@ -212,6 +212,89 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute procedure public.handle_new_user();
 
+-- Backfill otomatis untuk user yang sudah dibuat di auth.users sebelum schema.sql dijalankan
+insert into public.profiles (id, email, full_name, nip, role, unit_kerja)
+select
+  u.id,
+  coalesce(u.email, u.id::text || '@user.local'),
+  coalesce(nullif(u.raw_user_meta_data->>'full_name', ''), split_part(coalesce(u.email, 'User'), '@', 1)),
+  nullif(u.raw_user_meta_data->>'nip', ''),
+  case
+    when not exists (select 1 from public.profiles)
+      and row_number() over (order by u.created_at asc, u.id asc) = 1
+    then 'admin'
+    when (u.raw_user_meta_data->>'role') in ('admin', 'guru', 'tenaga_kependidikan')
+    then u.raw_user_meta_data->>'role'
+    else 'tenaga_kependidikan'
+  end,
+  nullif(u.raw_user_meta_data->>'unit_kerja', '')
+from auth.users u
+where not exists (select 1 from public.profiles p where p.id = u.id)
+on conflict (id) do nothing;
+
+-- RPC untuk sinkronisasi otomatis profil dari client jika user dibuat manual di Supabase Dashboard
+create or replace function public.ensure_my_profile()
+returns public.profiles
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  existing_profile public.profiles;
+  auth_user record;
+  existing_count integer;
+  assigned_role text;
+begin
+  if uid is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select * into existing_profile from public.profiles where id = uid limit 1;
+  if found then
+    return existing_profile;
+  end if;
+
+  select id, email, raw_user_meta_data into auth_user
+  from auth.users
+  where id = uid
+  limit 1;
+
+  if not found then
+    raise exception 'Auth user not found';
+  end if;
+
+  perform pg_advisory_xact_lock(90210);
+  select count(*) into existing_count from public.profiles;
+
+  if existing_count = 0 then
+    assigned_role := 'admin';
+  elsif (auth_user.raw_user_meta_data->>'role') in ('admin', 'guru', 'tenaga_kependidikan') then
+    assigned_role := auth_user.raw_user_meta_data->>'role';
+  else
+    assigned_role := 'tenaga_kependidikan';
+  end if;
+
+  insert into public.profiles (id, email, full_name, nip, role, unit_kerja)
+  values (
+    auth_user.id,
+    coalesce(auth_user.email, auth_user.id::text || '@user.local'),
+    coalesce(nullif(auth_user.raw_user_meta_data->>'full_name', ''), split_part(coalesce(auth_user.email, 'User'), '@', 1)),
+    nullif(auth_user.raw_user_meta_data->>'nip', ''),
+    assigned_role,
+    nullif(auth_user.raw_user_meta_data->>'unit_kerja', '')
+  )
+  on conflict (id) do update set email = excluded.email
+  returning * into existing_profile;
+
+  return existing_profile;
+end;
+$$;
+
+grant usage on schema public to anon, authenticated, service_role;
+grant select, insert, update, delete on all tables in schema public to authenticated, service_role;
+grant select on public.departments, public.classes to anon;
+grant execute on function public.ensure_my_profile() to authenticated;
+
 -- ----------------------------------------------------------------------------
 -- 9. HELPER FUNCTION NON-RECURSIVE & ROW LEVEL SECURITY (RLS)
 -- ----------------------------------------------------------------------------
@@ -223,6 +306,8 @@ security definer set search_path = public
 as $$
   select role from public.profiles where id = auth.uid() limit 1;
 $$;
+
+grant execute on function public.get_my_role() to authenticated;
 
 alter table public.departments enable row level security;
 alter table public.classes enable row level security;

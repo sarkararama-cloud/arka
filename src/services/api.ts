@@ -1,4 +1,5 @@
 import {isSupabaseConfigured, supabase} from '../lib/supabase';
+import schemaSqlRaw from '../../supabase/schema.sql?raw';
 import type {
   EmployeeAttendanceRecord,
   EmployeeAttendanceStatus,
@@ -54,6 +55,65 @@ async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> 
   return data as T;
 }
 
+async function fetchOrSyncSupabaseProfile(userId: string): Promise<UserProfile> {
+  if (!supabase) {
+    throw new Error('Supabase client belum dikonfigurasi.');
+  }
+
+  const {data: profile, error: profErr} = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (profErr) {
+    const msg = profErr.message || '';
+    if (
+      profErr.code === '42P01' ||
+      profErr.code === 'PGRST205' ||
+      msg.includes('does not exist') ||
+      msg.includes('Could not find the table')
+    ) {
+      throw new Error(
+        'Tabel public.profiles belum ada di Supabase. Buka tombol "SQL Schema", salin scriptnya, lalu jalankan di SQL Editor Supabase Anda.'
+      );
+    }
+  }
+
+  if (profile) {
+    return profile as UserProfile;
+  }
+
+  let rpcDetail = '';
+  // Fallback 1: panggil RPC ensure_my_profile() langsung di Supabase
+  try {
+    const {data: rpcProfile, error: rpcErr} = await supabase.rpc('ensure_my_profile');
+    if (!rpcErr && rpcProfile) {
+      return rpcProfile as UserProfile;
+    }
+    if (rpcErr?.message) {
+      rpcDetail = rpcErr.message;
+    }
+  } catch (e: unknown) {
+    rpcDetail = e instanceof Error ? e.message : '';
+  }
+
+  // Fallback 2: panggil backend endpoint /api/auth/sync-profile jika service_role tersedia
+  try {
+    const {user} = await fetchJson<{user: UserProfile}>('/api/auth/sync-profile', {
+      method: 'POST',
+    });
+    if (user) return user;
+  } catch {
+    // Abaikan jika backend route tidak tersedia
+  }
+
+  const extra = profErr?.message || rpcDetail;
+  throw new Error(
+    `Profil pengguna belum ada di tabel public.profiles${extra ? ` (${extra})` : ''}. Buka tombol "SQL Schema", salin seluruh script SQL terbaru, lalu jalankan di SQL Editor Supabase Anda.`
+  );
+}
+
 export const api = {
   async getBackendStatus(): Promise<{
     supabaseClientReady: boolean;
@@ -63,6 +123,9 @@ export const api = {
   },
 
   async getSchemaSql(): Promise<string> {
+    if (schemaSqlRaw) {
+      return schemaSqlRaw;
+    }
     const res = await fetch('/api/schema-sql');
     return res.text();
   },
@@ -89,13 +152,11 @@ export const api = {
       const {data: sessionData} = await supabase.auth.getSession();
       const user = sessionData.session?.user;
       if (!user) return null;
-      const {data: profile, error} = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', user.id)
-        .single();
-      if (error || !profile) return null;
-      return profile as UserProfile;
+      try {
+        return await fetchOrSyncSupabaseProfile(user.id);
+      } catch {
+        return null;
+      }
     }
 
     const token = localStorage.getItem(LOCAL_TOKEN_KEY);
@@ -115,15 +176,7 @@ export const api = {
       if (error || !data.user) {
         throw new Error(error?.message || 'Gagal masuk ke akun Supabase');
       }
-      const {data: profile, error: profErr} = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', data.user.id)
-        .single();
-      if (profErr || !profile) {
-        throw new Error('Profil pengguna tidak ditemukan di tabel profiles.');
-      }
-      return profile as UserProfile;
+      return await fetchOrSyncSupabaseProfile(data.user.id);
     }
 
     const {token, user} = await fetchJson<{token: string; user: UserProfile}>(
@@ -161,12 +214,12 @@ export const api = {
         return {user: null, needsEmailConfirmation: true};
       }
       if (data.user) {
-        const {data: profile} = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', data.user.id)
-          .single();
-        return {user: (profile as UserProfile) || null};
+        try {
+          const profile = await fetchOrSyncSupabaseProfile(data.user.id);
+          return {user: profile};
+        } catch {
+          return {user: null};
+        }
       }
       return {user: null};
     }
